@@ -3,6 +3,7 @@ use openssl::ssl::{SslContext, SslStream};
 use std::io::{Error, ErrorKind, Read, Result, Write, BufReader, BufRead};
 use std::{str};
 use regex::Regex;
+use email::{MimeMessage};
 
 enum IMAPStreamTypes {
     Basic(TcpStream),
@@ -30,6 +31,23 @@ impl Read for IMAPStreamTypes {
     }
 }
 
+impl Write for IMAPStreamTypes {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        match self {
+            &mut IMAPStreamTypes::Ssl(ref mut stream) => stream.write(buf),
+            &mut IMAPStreamTypes::Basic(ref mut stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match self {
+            &mut IMAPStreamTypes::Ssl(ref mut stream) => stream.flush(),
+            &mut IMAPStreamTypes::Basic(ref mut stream) => stream.flush(),
+        }
+
+    }
+}
+
 pub struct IMAPMailbox {
     pub flags: String,
     pub exists: u32,
@@ -49,7 +67,7 @@ impl IMAPStream {
                 let stream = match ssl_context {
                     Some(context) =>
                         BufReader::new(IMAPStreamTypes::Ssl(SslStream::connect(&context, stream).unwrap())),
-                        None => BufReader::new(IMAPStreamTypes::Basic(stream))
+                    None => BufReader::new(IMAPStreamTypes::Basic(stream))
                 };
 
                 let mut socket = IMAPStream {
@@ -144,12 +162,17 @@ impl IMAPStream {
 
     // FETCH
     pub fn fetch(&mut self, sequence_set: &str, query: &str) -> Result<Vec<String>> {
-        if let Err(e) = self.run_command(&format!("FETCH {} {}", sequence_set, query).to_string()) {
+        self.run_command_with_response(&format!("FETCH {} {}", sequence_set, query).to_string())
+    }
+
+    // FETCH, specific to RFC8222 messages
+    pub fn fetch_messages(&mut self, sequence_set: &str) -> Result<Vec<MimeMessage>> {
+        if let Err(e) = self.send_command(&format!("FETCH {} RFC822", sequence_set).to_string()) {
             return Err(e);
         }
 
-        self.read_fetch_rfc822_response();
-        Ok(vec![])
+        let messages = self.read_fetch_rfc822_response();
+        messages
     }
 
     // NOOP
@@ -276,56 +299,58 @@ impl IMAPStream {
                               format!("Invalid Response: {}", last_line).to_string()));
     }
 
-    fn write_str(&mut self, s: &str) -> Result<()> {
-        match self.stream.get_mut() {
-            &mut IMAPStreamTypes::Ssl(ref mut stream) => stream.write_fmt(format_args!("{}", s)),
-            &mut IMAPStreamTypes::Basic(ref mut stream) => stream.write_fmt(format_args!("{}", s)),
-        }
-    }
-
-    fn read_fetch_rfc822_response(&mut self) -> Result<()> {
-        let mut fetch_line = String::new();
-        self.stream.read_line(&mut fetch_line);
-        println!("{}", fetch_line);
+    fn read_fetch_rfc822_response(&mut self) -> Result<Vec<MimeMessage>> {
         lazy_static! {
-            // static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+[0-9]+\s+FETCH\s+\(RFC822\s+([0-9]+)").unwrap();
             static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+[0-9]+\s+FETCH\s+\(RFC822\s+\{([0-9]+)\}").unwrap();
-
         }
-        let mut response = vec![];
-        for cap in FETCH_REGEX.captures_iter(&fetch_line) {
-            if let Some(resp_size) = cap.at(1) {
-                let response_size = resp_size.parse::<usize>().unwrap();
-                // read the full response
-                response.resize(response_size, 0);
-                if let Ok(()) = self.stream.read_exact(&mut response) {
-                    print!("Read {} bytes from stream\n {}", response_size, str::from_utf8(&response).unwrap());
+
+        let mut messages = vec![];
+        loop {
+            let mut message_bytes = vec![];
+            let mut fetch_line = String::new();
+
+            // Read the first line to get the size of the message.
+            self.stream.read_line(&mut fetch_line);
+            println!("{}", fetch_line);
+
+            if let Some(m) = FETCH_REGEX.captures(&fetch_line) {
+                if let Some(resp_size) = m.at(1) {
+                    // Read the full email message
+                    let response_size = resp_size.parse::<usize>().unwrap();
+                    message_bytes.resize(response_size, 0);
+
+                    if let Ok(()) = self.stream.read_exact(&mut message_bytes) {
+                        // parse the full message and add to the message list.
+                        let message = MimeMessage::parse(&String::from_utf8_lossy(&message_bytes).to_string()).unwrap();
+                        println!("{:?}", message);
+                        messages.push(message);
+                    }
                 }
             }
             else {
                 println!("no match found");
+                break;
             }
-        }
-        fetch_line = String::new();
-        self.stream.read_line(&mut fetch_line);
-        println!("{}", fetch_line);
-        fetch_line = String::new();
-        self.stream.read_line(&mut fetch_line);
-        println!("{}", fetch_line);
 
-        Ok(())
+            fetch_line = String::new();
+            self.stream.read_line(&mut fetch_line);
+            println!("{}", fetch_line);
+        };
+
+        Ok(messages)
     }
 
-    fn read_response(&mut self) -> Result<Vec<String>> {
+    /// Read from the stream, collecting lines as strings, until we
+    /// find the string containing the message tag.
+    fn read_response(&mut self, tag: &str) -> Result<Vec<String>> {
         let mut lines = Vec::new();
-        let tag = format!("a{}", self.tag);
         let mut found_end = false;
         loop {
             let mut line = String::new();
             let num_read = self.stream.read_line(&mut line);
             match num_read {
                 Ok(_) => {
-                    if (&*line).starts_with(&*tag) {
+                    if (&*line).starts_with(tag) {
                         found_end = true;
                     }
                     lines.push(line);
@@ -360,9 +385,12 @@ impl IMAPStream {
         Ok(())
     }
 
-    fn create_command(&mut self, command: String) -> String {
-        let command = format!("{}{} {}\r\n", self.tag_prefix, self.tag, command);
-        return command;
+    /// Return a command with a unique tag and the tag itself.
+    fn create_command(&mut self, command: String) -> (String, String) {
+        let command_tag = format!("{}{}", self.tag_prefix, self.tag);
+        let command = format!("{} {}\r\n", command_tag, command);
+        self.tag += 1;
+        return (command, command_tag);
     }
 }
 

@@ -12,6 +12,7 @@ license = "Apache-2.0/MIT"
 openssl = "*"
 regex = "*"
 lazy_static = "0.2"
+email = "0"
 
 [[bin]]
 name = "example"
