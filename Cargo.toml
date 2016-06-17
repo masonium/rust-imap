@@ -11,6 +11,7 @@ license = "Apache-2.0/MIT"
 [dependencies]
 openssl = "*"
 regex = "*"
+lazy_static = "0.2"
 
 [[bin]]
 name = "example"
