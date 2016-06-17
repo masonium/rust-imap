@@ -1,6 +1,7 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use openssl::ssl::{SslContext, SslStream};
 use std::io::{Error, ErrorKind, Read, Result, Write, BufReader, BufRead};
+use std::collections::HashMap;
 use std::{str};
 use regex::Regex;
 use email::{MimeMessage};
@@ -165,14 +166,19 @@ impl IMAPStream {
         self.run_command_with_response(&format!("FETCH {} {}", sequence_set, query).to_string())
     }
 
-    // FETCH, specific to RFC8222 messages
-    pub fn fetch_messages(&mut self, sequence_set: &str) -> Result<Vec<MimeMessage>> {
+
+    /// Return a list of messages corresponding to a sequence of message-ids
+    pub fn fetch_messages(&mut self, sequence_set: &str) -> Result<HashMap<u32, MimeMessage>> {
         if let Err(e) = self.send_command(&format!("FETCH {} RFC822", sequence_set).to_string()) {
             return Err(e);
         }
 
         let messages = self.read_fetch_rfc822_response();
         messages
+    }
+
+    pub fn fetch_message(&mut self, message_id: u32) -> Result<Option<MimeMessage>> {
+        self.fetch_messages(&format!("{}", message_id)).map(|ref mut v| { v.remove(&message_id) })
     }
 
     // NOOP
@@ -299,22 +305,23 @@ impl IMAPStream {
                               format!("Invalid Response: {}", last_line).to_string()));
     }
 
-    fn read_fetch_rfc822_response(&mut self) -> Result<Vec<MimeMessage>> {
+    /// Return a list of MimeMessages, read from the stream after a
+    /// FETCH RFC822 call.
+    fn read_fetch_rfc822_response(&mut self) -> Result<HashMap<u32, MimeMessage>> {
         lazy_static! {
-            static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+[0-9]+\s+FETCH\s+\(RFC822\s+\{([0-9]+)\}").unwrap();
+            static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+([0-9]+)\s+FETCH\s+\(RFC822\s+\{([0-9]+)\}").unwrap();
         }
 
-        let mut messages = vec![];
+        let mut messages = HashMap::new();
         loop {
             let mut message_bytes = vec![];
             let mut fetch_line = String::new();
 
             // Read the first line to get the size of the message.
-            self.stream.read_line(&mut fetch_line);
-            println!("{}", fetch_line);
+            try!(self.stream.read_line(&mut fetch_line));
 
             if let Some(m) = FETCH_REGEX.captures(&fetch_line) {
-                if let Some(resp_size) = m.at(1) {
+                if let Some(resp_size) = m.at(2) {
                     // Read the full email message
                     let response_size = resp_size.parse::<usize>().unwrap();
                     message_bytes.resize(response_size, 0);
@@ -322,19 +329,16 @@ impl IMAPStream {
                     if let Ok(()) = self.stream.read_exact(&mut message_bytes) {
                         // parse the full message and add to the message list.
                         let message = MimeMessage::parse(&String::from_utf8_lossy(&message_bytes).to_string()).unwrap();
-                        println!("{:?}", message);
-                        messages.push(message);
+                        messages.insert(m.at(1).unwrap().parse::<u32>().unwrap(), message);
                     }
                 }
             }
             else {
-                println!("no match found");
                 break;
             }
 
             fetch_line = String::new();
-            self.stream.read_line(&mut fetch_line);
-            println!("{}", fetch_line);
+            try!(self.stream.read_line(&mut fetch_line));
         };
 
         Ok(messages)
