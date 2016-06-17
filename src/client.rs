@@ -79,40 +79,16 @@ impl IMAPStream {
     }
 
     fn parse_select_or_examine(lines: Vec<String>) -> Result<IMAPMailbox> {
-        let exists_regex = match Regex::new(r"^\* (\d+) EXISTS\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
+        lazy_static! {
+            static ref EXISTS_REGEX: Regex = Regex::new(r"^\* (\d+) EXISTS\r\n").unwrap();
+            static ref RECENT_REGEX: Regex = Regex::new(r"^\* (\d+) RECENT\r\n").unwrap();
+            static ref FLAGS_REGEX: Regex = Regex::new(r"^\* FLAGS (.+)\r\n").unwrap();
+            static ref UNSEEN_REGEX: Regex = Regex::new(r"^OK \[UNSEEN (\d+)\](.*)\r\n").unwrap();
+            static ref UID_VALIDITY_REGEX: Regex = Regex::new(r"^OK \[UIDVALIDITY (\d+)\](.*)\r\n").unwrap();
+            static ref UID_NEXT_REGEX: Regex =  Regex::new(r"^OK \[UIDNEXT (\d+)\](.*)\r\n").unwrap();
+            static ref PERMANENT_FLAGS_REGEX: Regex =  Regex::new(r"^OK \[PERMANENTFLAGS (.+)\]\r\n").unwrap();
+        }
 
-        let recent_regex = match Regex::new(r"^\* (\d+) RECENT\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
-
-        let flags_regex = match Regex::new(r"^\* FLAGS (.+)\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
-
-        let unseen_regex = match Regex::new(r"^OK \[UNSEEN (\d+)\](.*)\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
-
-        let uid_validity_regex = match Regex::new(r"^OK \[UIDVALIDITY (\d+)\](.*)\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
-
-        let uid_next_regex = match Regex::new(r"^OK \[UIDNEXT (\d+)\](.*)\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
-
-        let permanent_flags_regex = match Regex::new(r"^OK \[PERMANENTFLAGS (.+)\]\r\n") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
 
         // Check Ok
         match IMAPStream::parse_response_ok(lines.clone()) {
@@ -131,26 +107,26 @@ impl IMAPStream {
         };
 
         for line in lines.iter() {
-            if exists_regex.is_match(line) {
-                let cap = exists_regex.captures(line).unwrap();
+            if EXISTS_REGEX.is_match(line) {
+                let cap = EXISTS_REGEX.captures(line).unwrap();
                 mailbox.exists = cap.at(1).unwrap().parse::<u32>().unwrap();
-            } else if recent_regex.is_match(line) {
-                let cap = recent_regex.captures(line).unwrap();
+            } else if RECENT_REGEX.is_match(line) {
+                let cap = RECENT_REGEX.captures(line).unwrap();
                 mailbox.recent = cap.at(1).unwrap().parse::<u32>().unwrap();
-            } else if flags_regex.is_match(line) {
-                let cap = flags_regex.captures(line).unwrap();
+            } else if FLAGS_REGEX.is_match(line) {
+                let cap = FLAGS_REGEX.captures(line).unwrap();
                 mailbox.flags = cap.at(1).unwrap().to_string();
-            } else if unseen_regex.is_match(line) {
-                let cap = unseen_regex.captures(line).unwrap();
+            } else if UNSEEN_REGEX.is_match(line) {
+                let cap = UNSEEN_REGEX.captures(line).unwrap();
                 mailbox.unseen = Some(cap.at(1).unwrap().parse::<u32>().unwrap());
-            } else if uid_validity_regex.is_match(line) {
-                let cap = uid_validity_regex.captures(line).unwrap();
+            } else if UID_VALIDITY_REGEX.is_match(line) {
+                let cap = UID_VALIDITY_REGEX.captures(line).unwrap();
                 mailbox.uid_validity = Some(cap.at(1).unwrap().parse::<u32>().unwrap());
-            } else if uid_next_regex.is_match(line) {
-                let cap = uid_next_regex.captures(line).unwrap();
+            } else if UID_NEXT_REGEX.is_match(line) {
+                let cap = UID_NEXT_REGEX.captures(line).unwrap();
                 mailbox.uid_next = Some(cap.at(1).unwrap().parse::<u32>().unwrap());
-            } else if permanent_flags_regex.is_match(line) {
-                let cap = permanent_flags_regex.captures(line).unwrap();
+            } else if PERMANENT_FLAGS_REGEX.is_match(line) {
+                let cap = PERMANENT_FLAGS_REGEX.captures(line).unwrap();
                 mailbox.permanent_flags = Some(cap.at(1).unwrap().to_string());
             }
         }
@@ -251,6 +227,29 @@ impl IMAPStream {
                                       .to_string())
     }
 
+    // Send a command to the IMAP server, returning the tag that the
+    // command was sent with.
+    pub fn send_command(&mut self, untagged_command: &str) -> Result<String> {
+        let (command, command_tag) = self.create_command(untagged_command.to_string());
+
+        self.stream.get_mut().write(command.as_bytes()).map(|_| { command_tag })
+    }
+
+    /// Run the specified command, and read the response from the stream.
+    pub fn run_command_with_response(&mut self, untagged_command: &str) -> Result<Vec<String>> {
+        let tag = self.send_command(untagged_command);
+        if let Err(e) = tag {
+            return Err(e);
+        }
+
+        let ret = match self.read_response(&tag.unwrap()) {
+            Ok(lines) => Ok(lines),
+            Err(_) => Err(Error::new(ErrorKind::Other, "Failed to read")),
+        };
+
+        return ret;
+    }
+
     pub fn run_command_and_check_ok(&mut self, command: &str) -> Result<()> {
         match self.run_command_with_response(command) {
             Ok(lines) => IMAPStream::parse_response_ok(lines),
@@ -258,35 +257,15 @@ impl IMAPStream {
         }
     }
 
-    pub fn run_command(&mut self, untagged_command: &str) -> Result<()> {
-        let command = self.create_command(untagged_command.to_string());
-
-        self.write_str(&*command)
-    }
-
-    pub fn run_command_with_response(&mut self, untagged_command: &str) -> Result<Vec<String>> {
-        if let Err(e) = self.run_command(untagged_command) {
-            return Err(e);
-        }
-
-        let ret = match self.read_response() {
-            Ok(lines) => Ok(lines),
-            Err(_) => Err(Error::new(ErrorKind::Other, "Failed to read")),
-        };
-
-        self.tag += 1;
-
-        return ret;
-    }
 
     fn parse_response_ok(lines: Vec<String>) -> Result<()> {
-        let ok_regex = match Regex::new(r"^([a-zA-Z0-9]+) ([a-zA-Z0-9]+)(.*)") {
-            Ok(re) => re,
-            Err(err) => panic!("{}", err),
-        };
+        lazy_static! {
+            static ref OK_REGEX: Regex = Regex::new(r"^([a-zA-Z0-9]+) ([a-zA-Z0-9]+)(.*)").unwrap();
+        }
+
         let last_line = lines.last().unwrap();
 
-        for cap in ok_regex.captures_iter(last_line) {
+        for cap in OK_REGEX.captures_iter(last_line) {
             let response_type = cap.at(2).unwrap_or("");
             if response_type == "OK" {
                 return Ok(());
