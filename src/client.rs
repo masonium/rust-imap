@@ -177,6 +177,7 @@ impl IMAPStream {
         messages
     }
 
+    /// Fetch a single message from the esrever, returning the parsed mime-messages.
     pub fn fetch_message(&mut self, message_id: u32) -> Result<Option<MimeMessage>> {
         self.fetch_messages(&format!("{}", message_id)).map(|ref mut v| { v.remove(&message_id) })
     }
@@ -309,7 +310,7 @@ impl IMAPStream {
     /// FETCH RFC822 call.
     fn read_fetch_rfc822_response(&mut self) -> Result<HashMap<u32, MimeMessage>> {
         lazy_static! {
-            static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+([0-9]+)\s+FETCH\s+\(RFC822\s+\{([0-9]+)\}").unwrap();
+            static ref FETCH_REGEX: Regex = Regex::new(r"\*\s+(?P<message_id>[0-9]+)\s+FETCH\s+\(RFC822(\.HEADER|\.TEXT)?\s+\{(?P<response_size>[0-9]+)\}").unwrap();
         }
 
         let mut messages = HashMap::new();
@@ -321,7 +322,7 @@ impl IMAPStream {
             try!(self.stream.read_line(&mut fetch_line));
 
             if let Some(m) = FETCH_REGEX.captures(&fetch_line) {
-                if let Some(resp_size) = m.at(2) {
+                if let Some(resp_size) = m.name("response_size") {
                     // Read the full email message
                     let response_size = resp_size.parse::<usize>().unwrap();
                     message_bytes.resize(response_size, 0);
@@ -329,7 +330,7 @@ impl IMAPStream {
                     if let Ok(()) = self.stream.read_exact(&mut message_bytes) {
                         // parse the full message and add to the message list.
                         let message = MimeMessage::parse(&String::from_utf8_lossy(&message_bytes).to_string()).unwrap();
-                        messages.insert(m.at(1).unwrap().parse::<u32>().unwrap(), message);
+                        messages.insert(m.name("message_id").unwrap().parse::<u32>().unwrap(), message);
                     }
                 }
             }
