@@ -173,13 +173,26 @@ impl IMAPStream {
             return Err(e);
         }
 
-        let messages = self.read_fetch_rfc822_response();
-        messages
+        self.read_fetch_rfc822_response()
     }
 
     /// Fetch a single message from the esrever, returning the parsed mime-messages.
     pub fn fetch_message(&mut self, message_id: u32) -> Result<Option<MimeMessage>> {
         self.fetch_messages(&format!("{}", message_id)).map(|ref mut v| { v.remove(&message_id) })
+    }
+
+    /// Fetch and parse only the messages headers, instead of the entire message.
+    pub fn fetch_headers(&mut self, sequence_set: &str) -> Result<HashMap<u32, MimeMessage>> {
+        if let Err(e) = self.send_command(&format!("FETCH {} RFC822.HEADER", sequence_set).to_string()) {
+            return Err(e);
+        }
+
+        self.read_fetch_rfc822_response()
+    }
+
+    /// Fetch and parse a single message header.
+    pub fn fetch_header(&mut self, message_id: u32) -> Result<Option<MimeMessage>> {
+        self.fetch_headers(&format!("{}", message_id)).map(|ref mut v| { v.remove(&message_id) })
     }
 
     // NOOP
